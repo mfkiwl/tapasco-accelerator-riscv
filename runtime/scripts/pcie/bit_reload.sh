@@ -27,7 +27,7 @@ set -e
 
 # init paths
 DRIVER=tlkm
-DRIVERPATH="$TAPASCO_HOME_RUNTIME/kernel"
+DRIVERPATH="$TAPASCO_WORK_DIR/build/tlkm"
 BITLOAD_SCRIPT="$TAPASCO_HOME_RUNTIME/scripts/pcie/program_pcie.tcl"
 LOG_ID=$DRIVER"|""pci"
 
@@ -107,7 +107,7 @@ done
 shift "$((OPTIND-1))"
 
 BITSTREAM="$1"
-if [ -n $BITSTREAM ] && [[ $BITSTREAM == *.bit ]]
+if [ -n $BITSTREAM ] && [[ $BITSTREAM == *.@(bit|pdi)  ]]
 then
 	echo "bitstream = $BITSTREAM"
 

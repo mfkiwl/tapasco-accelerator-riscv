@@ -26,6 +26,8 @@
 #include "pcie.h"
 #include "pcie_device.h"
 #include "pcie_irq.h"
+#include "pcie_qdma.h"
+#include "pcie_svm.h"
 #include "tlkm_logging.h"
 #include "tlkm_device.h"
 #include "tlkm_bus.h"
@@ -380,6 +382,9 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 {
 	int ret = 0;
 	uint32_t status, c;
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	dev_addr_t mmu_base;
+#endif
 	struct tlkm_pcie_device *pdev =
 		(struct tlkm_pcie_device *)dev->private_data;
 
@@ -397,6 +402,15 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 		}
 	}
 
+	if (pcie_is_qdma_in_use(dev)) {
+		DEVLOG(dev->dev_id, TLKM_LF_PCIE, "initializing QDMA ...");
+		ret = pcie_qdma_init(pdev);
+		if (ret) {
+			DEVERR(dev->dev_id, "failed to initialize QDMA: %d", ret);
+			goto pcie_qdma_init_err;
+		}
+	}
+
 	DEVLOG(dev->dev_id, TLKM_LF_PCIE, "claiming MSI-X interrupts ...");
 	if ((ret = claim_msi(pdev))) {
 		DEVERR(dev->dev_id, "failed to claim MSI-X interrupts: %d",
@@ -404,19 +418,54 @@ int pcie_device_init_subsystems(struct tlkm_device *dev, void *data)
 		goto pcie_subsystem_err;
 	}
 
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	mmu_base =
+		tlkm_status_get_component_base(dev, "PLATFORM_COMPONENT_MMU");
+	if (mmu_base != -1) {
+		DEVLOG(dev->dev_id, TLKM_LF_DEVICE, "initializing SVM");
+		ret = pcie_init_svm(pdev);
+		if (ret) {
+			DEVERR(dev->dev_id, "failed to initialize SVM");
+			goto pcie_init_svm_err;
+		}
+	}
+#endif
+
 	DEVLOG(dev->dev_id, TLKM_LF_DEVICE,
 	       "successfully initialized subsystems");
 
 	return 0;
+
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+pcie_init_svm_err:
+	release_msi(pdev);
+#endif
 pcie_subsystem_err:
+pcie_qdma_init_err:
 	return ret;
 }
 
 void pcie_device_exit_subsystems(struct tlkm_device *dev)
 {
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	dev_addr_t mmu_base;
+#endif
 	struct tlkm_pcie_device *pdev =
 		(struct tlkm_pcie_device *)dev->private_data;
+
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	mmu_base = tlkm_status_get_component_base(dev, "PLATFORM_COMPONENT_MMU");
+	if (mmu_base != -1) {
+		pcie_exit_svm(pdev);
+	}
+#endif
+
 	release_msi(pdev);
+	if (pcie_is_qdma_in_use(dev)) {
+		if (pcie_qdma_exit(pdev)) {
+			DEVERR(dev->dev_id, "could not disable QDMA properly");
+		}
+	}
 	DEVLOG(dev->dev_id, TLKM_LF_DEVICE, "exited subsystems");
 }
 
@@ -426,6 +475,10 @@ void pcie_device_miscdev_close(struct tlkm_device *dev)
 		(struct tlkm_pcie_device *)dev->private_data;
 
 	int i;
+
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	dev_addr_t mmu_base;
+#endif
 
 	for (i = 0; i < TLKM_PCIE_NUM_DMA_BUFFERS; ++i) {
 		if (pdev->dma_buffer[i].ptr != 0) {
@@ -437,6 +490,15 @@ void pcie_device_miscdev_close(struct tlkm_device *dev)
 			pdev->dma_buffer[i].size = 0;
 		}
 	}
+
+#if defined(EN_SVM) && LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+	mmu_base =
+		tlkm_status_get_component_base(dev, "PLATFORM_COMPONENT_MMU");
+	if (mmu_base != -1) {
+		DEVLOG(dev->dev_id, TLKM_LF_DEVICE, "tear down SVM");
+		pcie_teardown_svm(dev);
+	}
+#endif
 }
 
 int pcie_device_dma_allocate_buffer(dev_id_t dev_id, struct tlkm_device *dev,

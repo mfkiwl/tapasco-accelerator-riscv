@@ -143,7 +143,7 @@ namespace eval arch {
 
     # create master ports
     set maxi_ports [list]
-    foreach mp [get_bd_intf_pins -of_objects $inst -filter {MODE == Master && CONFIG.PROTOCOL == AXI4}] {
+    foreach mp [get_bd_intf_pins -of_objects $inst -filter {MODE == Master && (CONFIG.PROTOCOL == AXI4 || CONFIG.PROTOCOL == AXI3)}] {
       set op [create_bd_intf_pin -vlnv "xilinx.com:interface:aximm_rtl:1.0" -mode Master [get_property NAME $mp]]
       connect_bd_intf_net $mp $op
       lappend maxi_ports $mp
@@ -225,7 +225,11 @@ namespace eval arch {
     # generate output trees
     for {set i 0} {$i < [llength $mdist]} {incr i} {
       puts "  mdist[$i] = [lindex $mdist $i]"
-      set out [tapasco::create_interconnect_tree "out_$i" [lindex $mdist $i]]
+      if {[tapasco::is_versal]} {
+        set out [tapasco::create_versal_interconnect_tree "out_$i" [lindex $mdist $i]]
+      } else {
+        set out [tapasco::create_interconnect_tree "out_$i" [lindex $mdist $i]]
+      }
       connect_bd_intf_net [get_bd_intf_pins -filter {MODE == Master && VLNV == "xilinx.com:interface:aximm_rtl:1.0"} -of_objects $out] [lindex $ic_ports $i]
     }
 
@@ -250,7 +254,11 @@ namespace eval arch {
       puts "Connecting one slave to host"
       return $out_port
     } {
-      set in1 [tapasco::create_interconnect_tree "in1" $ic_s false]
+      if {[tapasco::is_versal]} {
+        set in1 [tapasco::create_versal_interconnect_tree "in1" $ic_s false]
+      } else {
+        set in1 [tapasco::create_interconnect_tree "in1" $ic_s false]
+      }
 
       puts "Creating interconnects toward peripherals ..."
       puts "  $ic_s slaves to connect to host"
@@ -360,6 +368,7 @@ namespace eval arch {
           set intr_name "PE_${i}_${pe_sub_interrupt}"
           puts "Creating interrupt $intr_name"
           connect_bd_net $pin [::tapasco::ip::add_interrupt $intr_name "design"]
+          incr pe_sub_interrupt
       }
       incr i
     }
