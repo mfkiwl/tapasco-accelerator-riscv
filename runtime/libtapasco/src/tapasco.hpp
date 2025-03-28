@@ -47,7 +47,6 @@
 #include <tapasco_inner.hpp>
 
 namespace tapasco {
-using job_future = std::function<int(void)>;
 
 // Types which might still be used by legacy applications
 typedef DeviceAddress tapasco_handle_t;
@@ -163,6 +162,32 @@ template <typename T> VirtualAddress<T> makeVirtualAddress(T *t) {
 	return VirtualAddress<T>(t);
 }
 
+/**
+ * Wrapped pointer type to create input stream using DMA Streaming on Versal
+ **/
+template <typename T> struct InputStream final {
+  InputStream(T *value, size_t sz) : value(value), sz(sz) {};
+  T *value;
+  size_t sz;
+};
+
+template <typename T> InputStream<T> makeInputStream(T *t, size_t sz) {
+  return InputStream<T>(t, sz);
+}
+
+/**
+ * Wrapped pointer type to create output stream using DMA Streaming on Versal
+ */
+template <typename T> struct OutputStream final {
+  OutputStream(T *value, size_t sz) : value(value), sz(sz) {};
+  T *value;
+  size_t sz;
+};
+
+template <typename T> OutputStream<T> makeOutputStream(T *t, size_t sz) {
+  return OutputStream<T>(t, sz);
+}
+
 /** A TAPASCO runtime error. **/
 class tapasco_error : public std::runtime_error {
 public:
@@ -179,6 +204,40 @@ static void handle_error() {
   free(buf);
   throw tapasco_error(err_msg);
 }
+
+/**
+ * Wrapping class for release-callback of jobs.
+ */
+class JobFuture {
+public:
+  /**
+   * Constructor for uninitialized future. May be used if job is not started
+   * immediately and correct callback is set later.
+   */
+  JobFuture() : func([](bool b) -> int { throw tapasco_error("PE job not launched."); }) {};
+
+  /**
+   * Constructor for JobFuture with custom callback function. Callback is
+   * normally retrieved with getCallback() function of TapascoPE.
+   * @param f Callback function
+   */
+  JobFuture(std::function<int(bool)> f) : func(f) {}
+
+  int operator()() {
+    return func(true);
+  }
+
+  int operator()(bool block) {
+    return func(block);
+  }
+
+  void setCallback(std::function<int(bool)> f) {
+    func = f;
+  }
+private:
+  std::function<int(bool)> func;
+};
+using job_future = JobFuture;
 
 class JobArgumentList {
 public:
@@ -244,6 +303,10 @@ public:
 	  tapasco_job_param_virtualaddress(ptr, this->list_inner);
   }
 
+  void streamop(uint8_t *ptr, uintptr_t bytes, bool c2h) {
+    tapasco_job_param_stream(this->device, ptr, bytes, c2h, this->list_inner);
+  }
+
   void unset_from_device() { from_device = false; }
   void unset_to_device() { to_device = false; }
   void unset_free() { free = false; }
@@ -251,6 +314,17 @@ public:
   void set_offset(uint64_t offset) {
     this->offset_used = true;
     this->offset = offset;
+  }
+
+  template <typename T> void set_args(T &t) {
+    set_arg(t);
+  }
+
+  /** Variadic: recursively sets all given arguments. **/
+  template <typename T, typename... Targs>
+  void set_args(T &t, Targs... args) {
+    set_arg(t);
+    set_args(args...);
   }
 
 private:
@@ -264,6 +338,74 @@ private:
   bool offset_used{false};
   uint64_t offset{0};
   DeviceAddress deviceaddress{(DeviceAddress)-1};
+
+
+  /* Collector methods: bottom half of job launch. @} */
+
+  /* @{ Setters for register values */
+  /** Sets a single value argument. **/
+  template <typename T> void set_arg(T t) {
+    // only 32/64bit values can be passed directly (i.e., via register)
+    if (sizeof(T) == 4) {
+      this->single32((uint32_t)t);
+    } else if (sizeof(T) == 8) {
+      this->single64((uint64_t)t);
+    } else if (sizeof(T) > 8) {
+      throw tapasco_error("Please supply large arguments as wrapped pointers.");
+    } else {
+      throw tapasco_error("TaPaSCo supports 32 or 64 bit argument types or buffers. You provided an argument smaller than 32 bits.");
+    }
+  }
+
+  /** Sets a single pointer argument (alloc + copy). **/
+  template <typename T> void set_arg(T *t) {
+    throw tapasco_error("Pointers are not directly supported as they lack size "
+                        "information. Please use WrappedPointers.");
+  }
+
+  /** Sets local memory flag for transfer. */
+  template <typename T> void set_arg(Local<T> t) {
+    this->set_local();
+    set_arg(t.value);
+  }
+
+  /** Sets a single output-only pointer argument (alloc only). **/
+  template <typename T> void set_arg(OutOnly<T> t) {
+    this->unset_to_device();
+    set_arg(t.value);
+  }
+
+  /** Sets a single output-only pointer argument (alloc only). **/
+  template <typename T> void set_arg(InOnly<T> t) {
+    this->unset_from_device();
+    set_arg(t.value);
+  }
+
+  /** Sets a single output-only pointer argument (alloc only). **/
+  template <typename T> void set_arg(Offset<T> t) {
+    this->set_offset(t.offset);
+    set_arg(t.value);
+  }
+
+  /** Sets a single pointer argument (alloc + copy). **/
+  template <typename T> void set_arg(WrappedPointer<T> t) {
+    this->memop((uint8_t *)t.value, t.sz);
+  }
+
+  /** Sets a virtual address argument used for virtual pointers in SVM feature **/
+  template <typename T> void set_arg(VirtualAddress<T> t) {
+    this->virtaddr((uint8_t *)t.addr);
+  }
+
+  /** Sets a single pointer argument for host-to-card DMA streaming **/
+  template <typename T> void set_arg(InputStream<T> t) {
+    this->streamop((uint8_t *)t.value, t.sz, false);
+  }
+
+  /** Sets a single pointer argument for card-to-host DMA streaming **/
+  template <typename T> void set_arg(OutputStream<T> t) {
+    this->streamop((uint8_t *)t.value, t.sz, true);
+  }
 };
 
 class TapascoMemory {
@@ -336,6 +478,79 @@ private:
   TapascoOffchipMemory *mem;
 };
 
+class TapascoPE {
+public:
+  TapascoPE(Device *d, SinglePEHandler *p) : device(d), pe(p) {}
+
+  virtual ~TapascoPE() {
+    if (this->pe != 0) {
+      tapasco_pe_destroy(this->pe);
+      this->pe = 0;
+    }
+  }
+
+  TapascoMemory get_local_memory() {
+    TapascoOffchipMemory *mem = tapasco_pe_get_local_memory(this->pe);
+    if (mem == 0) {
+      handle_error();
+    }
+    return TapascoMemory(mem);
+  }
+
+  void release() {
+    tapasco_pe_release(this->pe);
+  }
+
+  template <typename R, typename... Targs>
+  job_future launch(RetVal<R> &ret, Targs... args) {
+    JobArgumentList a(this->device);
+    a.set_args(args...);
+
+    Job *j = tapasco_pe_create_job(pe);
+    if (j == 0) {
+      handle_error();
+    }
+
+    if (tapasco_job_start(j, a.list()) < 0) {
+      handle_error();
+    }
+
+    return [this, j, &ret, &args...]() {
+      uint64_t ret_val;
+      if (tapasco_job_release(j, &ret_val, true) < 0) {
+        handle_error();
+      }
+      *ret.value = (R)ret_val;
+      return 0;
+    };
+  }
+
+  template <typename... Targs> job_future launch(Targs... args) {
+    JobArgumentList a(this->device);
+    a.set_args(args...);
+
+    Job *j = tapasco_pe_create_job(pe);
+    if (j == 0) {
+      handle_error();
+    }
+
+    if (tapasco_job_start(j, a.list()) < 0) {
+      handle_error();
+    }
+
+    return [this, j, &args...]() {
+      if (tapasco_job_release(j, 0, true) < 0) {
+        handle_error();
+      }
+      return 0;
+    };
+  }
+
+private:
+  Device *device{0};
+  SinglePEHandler *pe{0};
+};
+
 class TapascoDevice {
 public:
   TapascoDevice(Device *d) : device(d) {}
@@ -389,11 +604,28 @@ public:
     return j;
   }
 
+  Job *try_acquire_pe(PEId pe_id) {
+    Job *j = nullptr;
+    if (!tapasco_device_try_acquire_pe(this->device, pe_id, &j)) {
+      handle_error();
+    }
+    return j;
+  }
+
   float design_frequency() {
     return tapasco_device_design_frequency(this->device);
   }
 
   Device *get_device() { return this->device; }
+
+  TapascoPE *acquire_pe_without_job(PEId pe_id) {
+    SinglePEHandler *pe = tapasco_device_acquire_pe_without_job(this->device, pe_id);
+    std::cout << "PE: " << pe << std::endl;
+    if (pe == 0) {
+      handle_error();
+    }
+    return new TapascoPE(this->device, pe);
+  }
 
 private:
   Device *device{0};
@@ -482,9 +714,9 @@ struct Tapasco {
   }
 
   template <typename R, typename... Targs>
-  job_future launch(PEId pe_id, RetVal<R> &ret, Targs... args) {
+  JobFuture launch(PEId pe_id, RetVal<R> &ret, Targs... args) {
     JobArgumentList a(this->device_internal.get_device());
-    set_args(a, args...);
+    a.set_args(args...);
 
     Job *j = this->device_internal.acquire_pe(pe_id);
     if (j == 0) {
@@ -495,19 +727,12 @@ struct Tapasco {
       handle_error();
     }
 
-    return [this, j, &ret, &args...]() {
-      uint64_t ret_val;
-      if (tapasco_job_release(j, &ret_val, true) < 0) {
-        handle_error();
-      }
-      *ret.value = (R)ret_val;
-      return 0;
-    };
+    return JobFuture(getCallback(ret, j));
   }
 
-  template <typename... Targs> job_future launch(PEId pe_id, Targs... args) {
+  template <typename... Targs> JobFuture launch(PEId pe_id, Targs... args) {
     JobArgumentList a(this->device_internal.get_device());
-    set_args(a, args...);
+    a.set_args(args...);
 
     Job *j = this->device_internal.acquire_pe(pe_id);
     if (j == 0) {
@@ -518,12 +743,68 @@ struct Tapasco {
       handle_error();
     }
 
-    return [this, j, &args...]() {
-      if (tapasco_job_release(j, 0, true) < 0) {
-        handle_error();
-      }
-      return 0;
-    };
+    return JobFuture(getCallback(j));
+  }
+
+  /**
+   * Launch a task on a PE if a matching PE is available at the moment.
+   * An uninitialized JobFuture must be passed by reference and the
+   * release-callback is set if the task could be launched on a PE.
+   *
+   * @param future JobFuture for this task
+   * @param pe_id PE-ID of this task
+   * @param ret PE return value
+   * @param args PE arguments
+   * @return zero - SUCCESS, -1 - no matching PE available
+   */
+  template <typename R, typename... Targs>
+  int try_launch(JobFuture &future, PEId pe_id, RetVal<R> &ret, Targs... args) {
+    Job *j = this->device_internal.try_acquire_pe(pe_id);
+    if (j == nullptr) {
+      return -1;
+    }
+
+    JobArgumentList a(this->device_internal.get_device());
+    a.set_args(args...);
+
+    if (tapasco_job_start(j, a.list()) < 0) {
+      handle_error();
+    }
+
+    future.setCallback(getCallback(ret, j));
+    return 0;
+  }
+
+  /**
+   * Launch a task on a PE if a matching PE is available at the moment.
+   * An uninitialized JobFuture must be passed by reference and the
+   * release-callback is set if the task could be launched on a PE.
+   *
+   * @param future JobFuture for this task
+   * @param pe_id PE-ID of this task
+   * @param args PE arguments
+   * @return zero - SUCCESS, -1 - no matching PE available
+   */
+  template <typename... Targs>
+  int try_launch(JobFuture &future, PEId pe_id, Targs... args) {
+    Job *j =  this->device_internal.try_acquire_pe(pe_id);
+    if (j == nullptr) {
+      return -1;
+    }
+
+    JobArgumentList a(this->device_internal.get_device());
+    a.set_args(args...);
+
+    if (tapasco_job_start(j, a.list()) < 0) {
+      handle_error();
+    }
+
+    future.setCallback(getCallback(j));
+    return 0;
+  }
+
+  TapascoPE *acquire_pe_without_job(PEId pe_id) {
+    return this->device_internal.acquire_pe_without_job(pe_id);
   }
 
   /**
@@ -638,72 +919,74 @@ struct Tapasco {
   }
 
 private:
-  /* Collector methods: bottom half of job launch. @} */
 
-  /* @{ Setters for register values */
-  /** Sets a single value argument. **/
-  template <typename T> void set_arg(JobArgumentList &a, T t) {
-    // only 32/64bit values can be passed directly (i.e., via register)
-    if (sizeof(T) == 4) {
-      a.single32((uint32_t)t);
-    } else if (sizeof(T) == 8) {
-      a.single64((uint64_t)t);
-    } else {
-      throw tapasco_error("Please supply large arguments as wrapped pointers.");
-    }
+  /* {@ Callback generation methods. */
+  /**
+   * Generate JobFuture callback function for PE job.
+   *
+   * If block argument of callback is set to true, the callback function will
+   * not return until the PE is finished and could be released. Otherwise, it
+   * returns "0" if the PE is finished and could be released, or "1" if it is
+   * still running.
+   *
+   * @param ret PE return value
+   * @param j Job obcect
+   * @return Callback function for JobFuture
+   */
+  template<typename R>
+  std::function<int(bool)> getCallback(RetVal<R> &ret, Job *j) const
+  {
+    return [this, j, &ret](bool block) {
+            uint64_t ret_val;
+            if (block) {
+              if (tapasco_job_release(j, &ret_val, true) < 0) {
+                handle_error();
+              }
+            } else {
+              int r = tapasco_job_try_release(j, &ret_val, true);
+              if (r < 0) {
+                std::cout << "Call handle_error()" << std::endl;
+                handle_error();
+              }
+              else if (r == 1)
+                return 1;
+            }
+            *ret.value = (R)ret_val;
+            return 0;
+    };
   }
 
-  /** Sets a single pointer argument (alloc + copy). **/
-  template <typename T> void set_arg(JobArgumentList &a, T *t) {
-    throw tapasco_error("Pointers are not directly supported as they lack size "
-                        "information. Please use WrappedPointers.");
+  /**
+   * Generate JobFuture callback function for PE job.
+   *
+   * If block argument of callback is set to true, the callback function will
+   * not return until the PE is finished and could be released. Otherwise, it
+   * returns "0" if the PE is finished and could be released, or "1" if it is
+   * still running.
+   *
+   * @param j Job object
+   * @return Callback function for JobFuture
+   */
+  std::function<int(bool)> getCallback(Job *j) const
+  {
+    return [this, j](bool block) {
+            if (block) {
+              if (tapasco_job_release(j, nullptr, true) < 0) {
+                handle_error();
+              }
+            } else {
+              int r = tapasco_job_try_release(j, nullptr, true);
+              if (r < 0) {
+                std::cout << "Call handle_error()" << std::endl;
+                handle_error();
+              }
+              else if (r == 1)
+                return 1;
+            }
+            return 0;
+    };
   }
-
-  /** Sets local memory flag for transfer. */
-  template <typename T> void set_arg(JobArgumentList &a, Local<T> t) {
-    a.set_local();
-    set_arg(a, t.value);
-  }
-
-  /** Sets a single output-only pointer argument (alloc only). **/
-  template <typename T> void set_arg(JobArgumentList &a, OutOnly<T> t) {
-    a.unset_to_device();
-    set_arg(a, t.value);
-  }
-
-  /** Sets a single output-only pointer argument (alloc only). **/
-  template <typename T> void set_arg(JobArgumentList &a, InOnly<T> t) {
-    a.unset_from_device();
-    set_arg(a, t.value);
-  }
-
-  /** Sets a single output-only pointer argument (alloc only). **/
-  template <typename T> void set_arg(JobArgumentList &a, Offset<T> t) {
-    a.set_offset(t.offset);
-    set_arg(a, t.value);
-  }
-
-  /** Sets a single pointer argument (alloc + copy). **/
-  template <typename T> void set_arg(JobArgumentList &a, WrappedPointer<T> t) {
-    a.memop((uint8_t *)t.value, t.sz);
-  }
-
-  /** Sets a virtual address argument used for virtual pointers in SVM feature **/
-  template <typename T> void set_arg(JobArgumentList &a, VirtualAddress<T> t) {
-	  a.virtaddr((uint8_t *)t.addr);
-  }
-
-  template <typename T> void set_args(JobArgumentList &a, T &t) {
-    set_arg(a, t);
-  }
-
-  /** Variadic: recursively sets all given arguments. **/
-  template <typename T, typename... Targs>
-  void set_args(JobArgumentList &a, T &t, Targs... args) {
-    set_arg(a, t);
-    set_args(a, args...);
-  }
-  /* Setters for register values @} */
+  /* Callback generation methods. @} */
 
   TapascoDriver driver_internal;
   TapascoDevice device_internal;

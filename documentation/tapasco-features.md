@@ -26,6 +26,35 @@ microblaze {
 }
 ```
 
+#### WrapAXIFull
+This determines whether potential AXI4-Full slave ports of the PEs are wrapped (i.e. converted to AXI4-Lite) before connecting them to the interconnect tree. By default this is activated, so all AXI4-Full slave ports are wrapped. This can be deactivated using:
+
+```
+WrapAXIFull {
+  enabled: false
+}
+```
+
+#### axi4mmUseSmartconnect
+This feature is specific to the axi4mm-architecture. It controls whether AXI interconnects or AXI smartconnects are used for control AND data aggregation in the architecture. By default AXI interconnects are used (except on VERSAL FPGAs). To use AXI smartconnects instead:
+
+```
+axi4mmUseSmartconnect {
+  enabled: true
+}
+```
+
+
+#### CustomConstraints
+This feature allows to include a custom constraints file (xdc).
+
+```
+CustomConstraints {
+  path: "/path/to/file.xdc" # this needs to be an absolute path
+}
+```
+
+
 ## Zynq based platforms
 
 ### ZC706
@@ -137,8 +166,41 @@ Regslice {
 ```
 If no value is given for a register slice (or for all), a default value is used. The default value for each register slice is the first value in the example above.
 
+#### SVM
+
+The Shared Virtual Memory (SVM) extensions is documented [here](tapasco-svm.md).
+
 ### Alveo U280
 
 #### SVM
 
-The Shared Virtual Memory (SVM) extensions is documented [here](tapasco-svm.md)
+The Shared Virtual Memory (SVM) extensions is documented [here](tapasco-svm.md).
+
+### Versal
+
+#### AI Engine
+
+```
+AI-Engine {
+  "freq": -1 | <MHz>, # Frequency of the AI engine
+  "adf": /path/to/libadf.a,
+  <AIE stream name>: <PE interface name> # supports wildcard matching for PE interface
+}
+```
+
+If no explicit stream connections are given in the plugin options, the plugin tries to match streams according to direction and datawidth. Please check the log file for the actual result. **Note**: Only Vivado 2023.1 and newer is supported for Versal AI Engines.
+
+#### DMA Streaming
+
+The DMA streaming feature allows to directly stream data from the DMA engine into the user PE, and the other way round. The user PE may provide standard AXI4 stream interfaces. The interface connections are specified in the feature properties as follows:
+
+```
+DMA-Streaming {
+  "master_port": <port_name>,
+  "slave_port": <port_name>
+}
+```
+
+In host software, use the ```makeInputStream()``` and ```makeOutputStream()``` wrapper of the C++ API, or the ```DataTransferStream``` parameter in Rust.
+
+**Note**: Currently the feature only supports one input and one output stream.

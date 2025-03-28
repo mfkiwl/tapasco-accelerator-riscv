@@ -2,7 +2,7 @@
 	"Name" : "HAWK",
 	"Description" : "prodesign HAWK VC1902 Acceleration Card",
 	"TclLibrary" : "hawk.tcl",
-	"Part" : "xcvc1902-vsva2197-1MP-e-S-es1",
+	"Part" : "xcvc1902-vsva2197-1MP-e-S",
 	"TargetUtilization" : 90,
 	"Benchmark" : "hawk.benchmark",
 	"HostFrequency": 250.0,

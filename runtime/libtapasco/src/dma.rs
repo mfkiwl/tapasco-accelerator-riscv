@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020 Embedded Systems and Applications, TU Darmstadt.
+ * Copyright (c) 2014-2023 Embedded Systems and Applications, TU Darmstadt.
  *
  * This file is part of TaPaSCo
  * (see https://github.com/esa-tu-darmstadt/tapasco).
@@ -20,17 +20,26 @@
 
 use crate::device::DeviceAddress;
 use crate::device::DeviceSize;
+use crate::protos::simcalls::ReadPlatform;
 use crate::tlkm::{tlkm_copy_cmd_from, tlkm_ioctl_svm_migrate_to_dev, tlkm_ioctl_svm_migrate_to_ram, tlkm_svm_migrate_cmd};
 use crate::tlkm::tlkm_copy_cmd_to;
 use crate::tlkm::tlkm_ioctl_copy_from;
 use crate::tlkm::tlkm_ioctl_copy_to;
-use crate::vfio::*;
 use core::fmt::Debug;
 use memmap::MmapMut;
 use snafu::ResultExt;
 use std::fs::File;
 use std::os::unix::prelude::*;
 use std::sync::Arc;
+use crate::sim_client::SimClient;
+use crate::protos::simcalls::{
+    write_platform::Data,
+    Data32,
+    WritePlatform,
+    WriteMemory,
+    ReadMemory,
+};
+use crate::sim_client;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -74,9 +83,15 @@ pub enum Error {
     TooManyInterrupts {},
 
     #[snafu(display("VFIO failed: {}", source))]
-    VfioError {source: crate::vfio::Error},
+    VfioError { source: crate::vfio::Error },
+
+    #[snafu(display("Error during gRPC communictaion {}", source))]
+    SimClientError { source: sim_client::Error },
+
+    #[snafu(display("Streams not supported on this platform"))]
+    StreamsNotSupported {},
 }
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Specifies a method to interact with DMA methods
 ///
@@ -84,6 +99,8 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub trait DMAControl: Debug {
     fn copy_to(&self, data: &[u8], ptr: DeviceAddress) -> Result<()>;
     fn copy_from(&self, ptr: DeviceAddress, data: &mut [u8]) -> Result<()>;
+    fn h2c_stream(&self, data: &[u8]) -> Result<()>;
+    fn c2h_stream(&self, data: &mut [u8]) -> Result<()>;
 }
 
 #[derive(Debug, Getters)]
@@ -139,23 +156,26 @@ impl DMAControl for DriverDMA {
                     length: data.len(),
                     user_addr: data.as_mut_ptr(),
                 },
-            )
-            .context(DMAFromDeviceSnafu)?;
+            ).context(DMAFromDeviceSnafu)?;
         };
         Ok(())
+    }
+
+    fn c2h_stream(&self, _data: &mut [u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
+
+    fn h2c_stream(&self, _data: &[u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
     }
 }
 
 #[derive(Debug, Getters)]
-pub struct VfioDMA {
-    vfio_dev: Arc<VfioDev>,
-}
+pub struct VfioDMA {}
 
 impl VfioDMA {
-    pub fn new(vfio_dev: &Arc<VfioDev>) -> Self {
-        Self {
-            vfio_dev: vfio_dev.clone(),
-        }
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
@@ -163,28 +183,16 @@ impl VfioDMA {
 ///
 /// This version may be used on ZynqMP based devices as an alternative to DriverDMA.
 /// It makes use of the SMMU to provide direct access to userspace memory to the PL.
+/// Thus, there is no need to copy any data.
 impl DMAControl for VfioDMA {
     fn copy_to(&self, data: &[u8], iova: DeviceAddress) -> Result<()> {
-        // No actual data is copied here. Instead, the page-aligned address region
-        // [va_start, va_start+map_len] is mapped to the I/O virtual address region
-        // [iova_start, iova_start+map_len] using the SMMU.
-        //
-        // The interval [va_start, va_start+map_len] is the smallest page-aligned
-        // interval that contains the 'data' buffer.
-        let va_start = to_page_boundary(data.as_ptr() as u64);
-        let iova_start = to_page_boundary(iova);
-        let map_len = self.vfio_dev
-            .get_region_size(iova_start)
-            .context(VfioSnafu)?;
-
         trace!(
-            "Copy Host({:?}) -> Device(0x{:x}) ({} Bytes). Map va=0x{:x} -> iova=0x{:x} len=0x{:x}",
-            data.as_ptr(), iova, data.len(), va_start, iova_start, map_len
+            "Copy Host({:?}) -> Device(0x{:x}) ({} Bytes)",
+            data.as_ptr(),
+            iova,
+            data.len()
         );
-        match vfio_dma_map(&self.vfio_dev, map_len, HP_OFFS + iova_start, va_start) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(Error::VfioError {source: e})
-        }
+        Ok(())
     }
 
     fn copy_from(&self, iova: DeviceAddress, data: &mut [u8]) -> Result<()> {
@@ -198,6 +206,14 @@ impl DMAControl for VfioDMA {
         // nothing to copy, 'data' is same buffer that PE operated on
         Ok(())
     }
+
+    fn c2h_stream(&self, _data: &mut [u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
+
+    fn h2c_stream(&self, _data: &[u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
 }
 
 /// Use the CPU to transfer data
@@ -210,14 +226,16 @@ pub struct DirectDMA {
     offset: DeviceAddress,
     size: DeviceSize,
     memory: Arc<MmapMut>,
+    dev_name: String,
 }
 
 impl DirectDMA {
-    pub fn new(offset: DeviceAddress, size: DeviceSize, memory: Arc<MmapMut>) -> Self {
+    pub fn new(offset: DeviceAddress, size: DeviceSize, memory: Arc<MmapMut>, dev_name: String) -> Self {
         Self {
             offset,
             size,
             memory,
+            dev_name,
         }
     }
 }
@@ -245,10 +263,31 @@ impl DMAControl for DirectDMA {
         // Locking the mmap would slow down PE start etc too much
         unsafe {
             let p = self.memory.as_ptr().offset((self.offset + ptr) as isize) as *mut u8;
-            let s = std::ptr::slice_from_raw_parts_mut(p, data.len());
-            (*s).clone_from_slice(data);
-        }
+            
+            //on armv8 unaligned accesses to device memory result in a bus error
+            if self.dev_name == "zynqmp" {
+                let remaining_bytes = data.len() % 8;
+                let aligned_bytes = data.len() - remaining_bytes;
+                let unaligned = remaining_bytes != 0;
+                
+                //use clone_from_slice for the aligned portion of the data to
+                //maintain fast transfer speeds
+                let s: *mut [u8] = std::ptr::slice_from_raw_parts_mut(p, aligned_bytes);
+                (*s).clone_from_slice(&data[..(aligned_bytes)]);
 
+                if unaligned {
+                    let rem_s: *mut [u8] = std::ptr::slice_from_raw_parts_mut(p.offset(aligned_bytes as isize), remaining_bytes);
+                    //transfer the remaining bytes individually
+                    for i in 0..remaining_bytes {
+                        (*rem_s)[i] = data[aligned_bytes + i];
+                    }
+                }
+            } else {
+                let s: *mut [u8] = std::ptr::slice_from_raw_parts_mut(p, data.len());
+                (*s).clone_from_slice(data);                
+            }
+            
+        }
         Ok(())
     }
 
@@ -268,12 +307,38 @@ impl DMAControl for DirectDMA {
             ptr,
             data.len()
         );
+        
+        if self.dev_name == "zynqmp" {
+            let remaining_bytes = data.len() % 8;
+            let aligned_bytes = data.len() - remaining_bytes;
+            let unaligned = remaining_bytes != 0;
+            let aligned_end = end - remaining_bytes as u64;
 
-        data[..].clone_from_slice(
-            &self.memory[(self.offset + ptr) as usize..(self.offset + end) as usize],
-        );
+            data[..(aligned_bytes)].clone_from_slice(
+                &self.memory[(self.offset + ptr) as usize..(self.offset + aligned_end) as usize]
+            );
+            
+            if unaligned {
+                for i in 0..remaining_bytes {
+                    let mem_idx: usize = (self.offset + aligned_end) as usize + i;
+                    data[aligned_bytes + i] = self.memory[mem_idx];
+                }
+            }
+        } else {
+            data[..].clone_from_slice(
+                &self.memory[(self.offset + ptr) as usize..(self.offset + end) as usize],
+            );
+        }
 
         Ok(())
+    }
+
+    fn c2h_stream(&self, _data: &mut [u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
+
+    fn h2c_stream(&self, _data: &[u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
     }
 }
 
@@ -327,5 +392,100 @@ impl DMAControl for SVMDMA {
         }
         trace!("Migration to host memory complete.");
         Ok(())
+    }
+
+    fn c2h_stream(&self, _data: &mut [u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
+
+    fn h2c_stream(&self, _data: &[u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
+}
+
+#[derive(Debug, Getters)]
+pub struct SimDMA {
+    client: SimClient,
+    offset: DeviceAddress,
+    size: DeviceSize,
+    is_platform: bool,
+}
+
+impl SimDMA {
+    pub fn new(
+        offset: DeviceAddress,
+        size: DeviceSize,
+        is_platform: bool
+    ) -> Result<Self> {
+        Ok(Self {
+            client: SimClient::new().context(SimClientSnafu)?,
+            offset,
+            size,
+            is_platform,
+        })
+    }
+}
+
+
+impl DMAControl for SimDMA {
+    fn copy_to(&self, data: &[u8], ptr: DeviceAddress) -> Result<()> {
+        let end = ptr + data.len() as u64;
+        if end > self.size {
+            return Err(Error::OutOfRange {
+                ptr,
+                end,
+                size: self.size,
+            });
+        }
+        if self.is_platform {
+            let (_, ints, _) = unsafe {data.align_to::<u32>()};
+            self.client.write_platform(WritePlatform {
+                addr: self.offset + ptr as u64,
+                data: Some(Data::U32(Data32 {value: ints.to_vec()})),
+            }).context(SimClientSnafu)?;
+        } else {
+            self.client.write_memory(WriteMemory {
+                addr: self.offset + ptr as u64,
+                data: data.iter().map(|b| *b as u32).collect(),
+            }).context(SimClientSnafu)?;
+        }
+        Ok(())
+    }
+
+    fn copy_from(&self, ptr: DeviceAddress, data: &mut [u8]) -> Result<()> {
+        let end = ptr + data.len() as u64;
+        if end > self.size {
+            return Err(Error::OutOfRange {
+                ptr,
+                end,
+                size: self.size,
+            });
+        }
+
+        if self.is_platform {
+            let request = ReadPlatform {
+                addr: self.offset + ptr as u64,
+                num_bytes: data.len() as u32,
+            };
+            let read_platform_response = self.client.read_platform(request).context(SimClientSnafu)?;
+            data.copy_from_slice(read_platform_response.iter().map(|val| *val as u8).collect::<Vec<u8>>().as_mut_slice());
+        } else {
+            let request = ReadMemory {
+                addr: self.offset + ptr as u64,
+                length: data.len() as u64,
+            };
+            let read_memory_response = self.client.read_memory(request).context(SimClientSnafu)?;
+            data.copy_from_slice(read_memory_response.iter().map(|val| *val as u8).collect::<Vec<u8>>().as_mut_slice());
+        }
+
+        Ok(())
+    }
+
+    fn c2h_stream(&self, _data: &mut [u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
+    }
+
+    fn h2c_stream(&self, _data: &[u8]) -> Result<()> {
+        Err(Error::StreamsNotSupported {})
     }
 }

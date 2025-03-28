@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020 Embedded Systems and Applications, TU Darmstadt.
+ * Copyright (c) 2014-2023 Embedded Systems and Applications, TU Darmstadt.
  *
  * This file is part of TaPaSCo
  * (see https://github.com/esa-tu-darmstadt/tapasco).
@@ -18,14 +18,15 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-use crate::device::{DataTransferAlloc, DeviceAddress};
+use crate::device::{DataTransferAlloc, DataTransferStream, DeviceAddress};
 use crate::device::DataTransferPrealloc;
 use crate::device::PEParameter;
 use crate::pe::CopyBack;
 use crate::pe::PE;
-use crate::scheduler::Scheduler;
+use crate::scheduler::ReleasePE;
 use snafu::ResultExt;
 use std::sync::Arc;
+use std::thread;
 
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(_error: std::sync::PoisonError<T>) -> Self {
@@ -62,6 +63,9 @@ pub enum Error {
     #[snafu(display("Parameter only supported for bitstreams with enabled SVM support: {:?}", arg))]
     UnsupportedSVMParameter { arg: PEParameter },
 
+    #[snafu(display("Too many streams. Only one input and output stream supported"))]
+    TooManyStreams {},
+
     #[snafu(display("Scheduler Error: {}", source))]
     SchedulerError { source: crate::scheduler::Error },
 
@@ -82,7 +86,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct Job {
     pe: Option<PE>,
-    scheduler: Arc<Scheduler>,
+    scheduler: Arc<dyn ReleasePE>,
 }
 
 /// Release the PE if it's no longer needed.
@@ -103,7 +107,7 @@ impl Job {
     /// Not used directly. Request a Job through [`acquire_pe`].
     ///
     /// [`acquire_pe`]: ../device/struct.Device.html#method.acquire_pe
-    pub fn new(pe: PE, scheduler: &Arc<Scheduler>) -> Self {
+    pub fn new(pe: PE, scheduler: &Arc<impl ReleasePE + 'static>) -> Self {
         Self {
             pe: Some(pe),
             scheduler: scheduler.clone(),
@@ -234,6 +238,50 @@ impl Job {
         }
     }
 
+    /// Launch threads to move data from/to device constantly during PE execution using the
+    /// streaming feature of QDMA on Versal boards
+    fn handle_stream_transfers(&mut self, args: Vec<PEParameter>) -> Result<Vec<PEParameter>> {
+        trace!("Handling streaming parameters");
+        let mut first_c2h_stream = true;
+        let mut first_h2c_stream = true;
+        let new_params = args
+            .into_iter()
+            .try_fold(Vec::new(), |mut v, arg | match arg {
+                PEParameter::DataTransferStream(mut s) => {
+                    // Limit to one input and output stream respectively
+                    if s.c2h {
+                        if first_c2h_stream {
+                            first_c2h_stream = false;
+                        } else {
+                            return Err(Error::TooManyStreams {});
+                        }
+                    } else {
+                        if first_h2c_stream {
+                            first_h2c_stream = false;
+                        } else {
+                            return Err(Error::TooManyStreams {});
+                        }
+                    }
+                    let handle = thread::spawn(move || -> crate::dma::Result<DataTransferStream> {
+                        if s.c2h {
+                            s.memory.dma().c2h_stream(&mut s.data[..])?;
+                        } else {
+                            s.memory.dma().h2c_stream(&s.data[..])?;
+                        };
+                        Ok(s)
+                    });
+                    self.pe.as_mut().unwrap()
+                        .add_copyback(CopyBack::Stream(handle));
+                    Ok(v)
+                }
+                _ => {
+                    v.push(arg);
+                    Ok(v)
+                }
+            });
+        new_params
+    }
+
     /// Start PE execution with the given parameters. This function does not block.
     ///
     /// # Arguments
@@ -253,6 +301,7 @@ impl Job {
         trace!("Handled allocates => {:?}.", local_args);
         let (trans_args, unused_mem) = self.handle_transfers_to_device(local_args)?;
         trace!("Handled transfers => {:?}.", trans_args);
+        let trans_args = self.handle_stream_transfers(trans_args)?;
         trace!("Setting arguments.");
         for (i, arg) in trans_args.into_iter().enumerate() {
             trace!("Setting argument {} => {:?}.", i, arg);
@@ -326,40 +375,84 @@ impl Job {
                     .context(SchedulerSnafu)?;
             }
             trace!("Release successful.");
-            match copyback {
-                Some(copybacks) => {
-                    let mut res = Vec::new();
+            Self::handle_copyback(return_value, copyback)
+        } else {
+            Err(Error::NoPEtoRelease {})
+        }
+    }
 
-                    for param in copybacks {
-                        match param {
-                            CopyBack::Transfer(mut transfer) => {
+    fn handle_copyback(return_value: u64, copyback: Option<Vec<CopyBack>>) -> Result<(u64, Vec<Box<[u8]>>)> {
+        match copyback {
+            Some(copybacks) => {
+                let mut res = Vec::new();
+
+                for param in copybacks {
+                    match param {
+                        CopyBack::Transfer(mut transfer) => {
+                            transfer
+                                .memory
+                                .dma()
+                                .copy_from(transfer.device_address, &mut transfer.data[..])
+                                .context(DMASnafu)?;
+                            if transfer.free {
                                 transfer
                                     .memory
-                                    .dma()
-                                    .copy_from(transfer.device_address, &mut transfer.data[..])
-                                    .context(DMASnafu)?;
-                                if transfer.free {
-                                    transfer
-                                        .memory
-                                        .allocator()
-                                        .lock()?
-                                        .free(transfer.device_address)
-                                        .context(AllocatorSnafu)?;
-                                }
-                                res.push(transfer.data);
+                                    .allocator()
+                                    .lock()?
+                                    .free(transfer.device_address)
+                                    .context(AllocatorSnafu)?;
                             }
-                            CopyBack::Free(addr, mem) => {
-                                mem.allocator().lock()?.free(addr).context(AllocatorSnafu)?;
-                            }
-                            CopyBack::Return(transfer) => {
-                                res.push(transfer.data);
-                            }
+                            res.push(transfer.data);
+                        }
+                        CopyBack::Free(addr, mem) => {
+                            mem.allocator().lock()?.free(addr).context(AllocatorSnafu)?;
+                        }
+                        CopyBack::Stream(handle) => {
+                            let h = handle.join().unwrap().context(DMASnafu )?;
+
+                            // always return stream buffer so that the user can continue
+                            // using the buffer
+                            res.push(h.data);
+                        }
+                        CopyBack::Return(transfer) => {
+                            res.push(transfer.data);
                         }
                     }
-
-                    Ok((return_value, res))
                 }
-                None => Ok((return_value, Vec::new())),
+
+                Ok((return_value, res))
+            }
+            None => Ok((return_value, Vec::new())),
+        }
+    }
+
+    /// Release job if it has finished and handle copy back if necessary.
+    ///
+    /// # Arguments
+    ///  * `release_pe`: Set if PE should be released so it can be used by another Job.
+    ///  * `return_value`: Set if the return value should be read from the PE.
+    /// # Returns
+    ///  * An empty Option if the job is still running, or a Option with a Tuple of
+    ///    a: The return value if requested through `return_value`,
+    ///    b: The memories that have been used for copy backs after the job execution. Order is maintained according to the original argument list.
+    ///       If the SVM feature is in use return ALL memories so that the user can regain ownership of "in-only" buffers as well.
+    pub fn try_release(&mut self, release_pe: bool, return_value: bool) -> Result<Option<(u64, Vec<Box<[u8]>>)>> {
+        if self.pe.is_some() {
+            trace!("Trying to release PE {:?}.", self.pe.as_ref().unwrap().id());
+            let res = self.pe.as_mut().unwrap().try_release(return_value).context(PESnafu)?;
+
+            match res {
+                Some((ret_val, copyback)) => {
+                    if release_pe {
+                        self.scheduler
+                            .release_pe(self.pe.take().unwrap())
+                            .context(SchedulerSnafu)?;
+                    }
+                    trace!("Release successful.");
+                    let r = Self::handle_copyback(ret_val, copyback)?;
+                    Ok(Some(r))
+                },
+                None => Ok(None)
             }
         } else {
             Err(Error::NoPEtoRelease {})

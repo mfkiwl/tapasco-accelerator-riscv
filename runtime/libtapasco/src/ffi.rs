@@ -18,7 +18,7 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-use crate::device::DataTransferAlloc;
+use crate::device::{DataTransferAlloc, DataTransferStream};
 use crate::device::DataTransferLocal;
 use crate::device::DataTransferPrealloc;
 use crate::device::Device;
@@ -31,6 +31,7 @@ use crate::tlkm::tlkm_access;
 use crate::tlkm::DeviceId;
 use crate::tlkm::DeviceInfo;
 use crate::tlkm::TLKM;
+use crate::scheduler::SinglePEHandler;
 use core::cell::RefCell;
 use libc::c_char;
 use libc::c_int;
@@ -49,6 +50,9 @@ pub enum Error {
 
     #[snafu(display("Error during Device operation: {}", source))]
     DeviceError { source: crate::device::Error },
+
+    #[snafu(display("Error during Scheduler operation: {}", source))]
+    SchedulerError { source: crate::scheduler::Error },
 
     #[snafu(display("Error during DMA operation: {}", source))]
     DMAError { source: crate::dma::Error },
@@ -534,6 +538,43 @@ pub unsafe extern "C" fn tapasco_job_param_virtualaddress(addr: *const u8, list:
     list
 }
 
+/// # Safety
+/// TODO
+#[no_mangle]
+pub unsafe extern "C" fn tapasco_job_param_stream(
+    dev: *mut Device,
+    ptr: *mut u8,
+    bytes: usize,
+    c2h: bool,
+    list: *mut JobList,
+) -> *mut JobList {
+    if list.is_null() {
+        warn!("Null pointer passed into tapasco_job_param_stream() as the list");
+        update_last_error(Error::NullPointerTLKM {});
+        return ptr::null_mut();
+    }
+
+    let d = &mut *dev;
+    let mem = match d.default_memory().context(RetrieveDefaultMemorySnafu) {
+        Ok(x) => x,
+        Err(e) => {
+            warn!("Failed to retrieve default memory from device.");
+            update_last_error(e);
+            return ptr::null_mut();
+        }
+    };
+
+    let v = Box::from_raw(slice::from_raw_parts_mut(ptr, bytes));
+
+    let tl = &mut *list;
+    tl.push(PEParameter::DataTransferStream(DataTransferStream {
+        data: v,
+        c2h: c2h,
+        memory: mem,
+    }));
+    list
+}
+
 /////////////////
 // Handle Device Access
 /////////////////
@@ -626,6 +667,40 @@ pub unsafe extern "C" fn tapasco_device_acquire_pe(dev: *mut Device, id: PEId) -
     }
 }
 
+#[no_mangle]
+/// Acquire PE if available and return job.
+///
+/// # Arguments
+///  * `dev`: Device on which the PE should be acquired.
+///  * `id`: PE ID of PE.
+///  * `job`: Double pointer to return job object.
+/// # Returns
+///  * 'false' if an error occurred, 'true' otherwise with `job` pointing to the new job object, or as null pointer if no PE is available
+pub unsafe extern "C" fn tapasco_device_try_acquire_pe(dev: *mut Device, id: PEId, job: *mut *mut Job) -> bool {
+    if dev.is_null() {
+        warn!("Null pointer passed into tapasco_device_acquire_pe() as the device");
+        update_last_error(Error::NullPointerTLKM {});
+        *job = ptr::null_mut();
+        return false;
+    }
+
+    let tl = &mut *dev;
+    match tl.try_acquire_pe(id) {
+        Ok(x) => {
+            *job = match x {
+                Some(j) => std::boxed::Box::<Job>::into_raw(Box::new(j)),
+                None => ptr::null_mut()
+            };
+            true
+        },
+        Err(e) => {
+            *job = ptr::null_mut();
+            update_last_error(Error::DeviceError { source: e });
+            false
+        }
+    }
+}
+
 /// # Safety
 /// TODO
 #[no_mangle]
@@ -706,6 +781,49 @@ pub unsafe extern "C" fn tapasco_job_release(
             }
             0
         }
+        Err(e) => {
+            update_last_error(e);
+            -1
+        }
+    }
+}
+
+#[no_mangle]
+/// Release job if it has finished.
+///
+/// # Arguments
+///  * `job`: Job to be released.
+///  * `return_value`: Set if return value should be read from PE.
+///  * `release`: Set if PE should be released if job has finished.
+/// # Returns
+///  * '-1' in case an error occurred, '0' if the job is released, and '1' if the job is still running and could not be released yet
+pub unsafe extern "C" fn tapasco_job_try_release(
+    job: *mut Job,
+    return_value: *mut u64,
+    release: bool,
+) -> isize {
+    if job.is_null() {
+        warn!("Null pointer passed onto tapasco_job_try_release() as the job");
+        update_last_error(Error::NullPointerTLKM {});
+        return -1;
+    }
+
+    let tl = &mut *job;
+    match tl.try_release(release, !return_value.is_null()).context(JobSnafu) {
+        Ok(x) => {
+            match x {
+                Some((r, v)) => {
+                    for d in v {
+                        let _p = std::boxed::Box::<[u8]>::into_raw(d);
+                    }
+                    if !return_value.is_null() {
+                        *return_value = r;
+                    }
+                    0
+                },
+                None => 1,
+            }
+        },
         Err(e) => {
             update_last_error(e);
             -1
@@ -884,6 +1002,98 @@ pub unsafe extern "C" fn tapasco_memory_free(
         Err(e) => {
             update_last_error(e);
             -1
+        }
+    }
+}
+
+
+///////////////////
+// Manual PE handling
+///////////////////
+
+
+#[no_mangle]
+pub unsafe extern "C" fn tapasco_device_acquire_pe_without_job(dev: *mut Device, id: PEId) -> *mut SinglePEHandler {
+    if dev.is_null() {
+        warn!("Null pointer passed into tapasco_device_acquire_pe_without_job() as the device");
+        update_last_error(Error::NullPointerTLKM {});
+        return ptr::null_mut();
+    }
+
+    let tl = &mut *dev;
+    match tl.acquire_single_pe_scheduler(id).context(DeviceSnafu) {
+        Ok(x) => {
+            std::boxed::Box::<SinglePEHandler>::into_raw(Box::new(x))
+        },
+        Err(e) => {
+            update_last_error(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tapasco_pe_create_job(pe: *mut SinglePEHandler) -> *mut Job {
+    if pe.is_null() {
+        warn!("Null pointer passed into tapasco_pe_create_job() as the pe");
+        update_last_error(Error::NullPointerTLKM {});
+        return ptr::null_mut();
+    }
+
+    let tl = &mut *pe;
+
+    match tl.acquire_pe().context(SchedulerSnafu) {
+        Ok(x) => {
+            std::boxed::Box::<Job>::into_raw(Box::new(x))
+        },
+        Err(e) => {
+            update_last_error(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tapasco_pe_get_local_memory(pe: *mut SinglePEHandler) -> *mut TapascoOffchipMemory {
+    if pe.is_null() {
+        warn!("Null pointer passed into tapasco_pe_get_local_memory() as the pe");
+        update_last_error(Error::NullPointerTLKM {});
+        return ptr::null_mut();
+    }
+    match (*pe).get_local_memory().context(SchedulerSnafu) {
+        Ok(m) => {
+            Box::into_raw(Box::new(m.clone()))
+        },
+        Err(e) => {
+            update_last_error(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tapasco_pe_release(pe: *mut SinglePEHandler) {
+    if pe.is_null() {
+        warn!("Null pointer passed into tapasco_pe_release() as the pe");
+        update_last_error(Error::NullPointerTLKM {});
+    }
+
+    let tl = &mut *pe;
+    match tl.release_pe().context(SchedulerSnafu) {
+        Ok(()) => {},
+        Err(e) => {
+            update_last_error(e);
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn tapasco_pe_destroy(pe: *mut SinglePEHandler) {
+    let mut _b: Box<SinglePEHandler> = Box::from_raw(pe);
+    match _b.release_pe().context(SchedulerSnafu) {
+        Ok(()) => {},
+        Err(e) => {
+            update_last_error(e);
         }
     }
 }

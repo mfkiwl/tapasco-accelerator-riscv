@@ -6,9 +6,10 @@ use log::{error, trace, warn};
 
 use tapasco::{
     device::PEParameter,
-    device::{status::Interrupt, Device},
+    device::Device,
+    protos::status::Interrupt,
     pe::PE,
-    tlkm::TLKM,
+    tlkm::TLKM, mmap_mut::{tapasco_write_volatile, ValType},
 };
 
 use chrono::{TimeZone, Utc};
@@ -171,7 +172,7 @@ impl<'a> App<'a> {
         bitstream_info += &format!(
             "Bitstream generated at: {} ({})\n\n",
             if let Ok(i) = tlkm_device.status().timestamp.try_into() {
-                format!("{}", Utc.timestamp(i, 0).format("%Y-%m-%d"))
+                format!("{}", Utc.timestamp_opt(i, 0).unwrap().format("%Y-%m-%d"))
             } else {
                 "the future".to_string()
             },
@@ -418,8 +419,10 @@ impl<'a> App<'a> {
                 //(*volatile_ptr).write(1);
                 //
                 // but instead of the `volatile` crate use std::ptr:
-                let ptr = pe.memory().as_ptr().offset(offset);
-                (ptr as *mut u32).write_volatile(1);
+                // this is the old way of accessing memory of a pe
+                // let ptr = pe.memory().as_ptr().offset(offset);
+                // (ptr as *mut u32).write_volatile(1);
+                tapasco_write_volatile(pe.memory(), offset, ValType::U32(1))
             }
 
             return format!(

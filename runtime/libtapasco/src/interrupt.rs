@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020 Embedded Systems and Applications, TU Darmstadt.
+ * Copyright (c) 2014-2023 Embedded Systems and Applications, TU Darmstadt.
  *
  * This file is part of TaPaSCo
  * (see https://github.com/esa-tu-darmstadt/tapasco).
@@ -18,16 +18,21 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+use std::fmt::Debug;
 use crate::tlkm::tlkm_ioctl_reg_interrupt;
 use crate::tlkm::tlkm_register_interrupt;
-use nix::sys::eventfd::eventfd;
-use nix::sys::eventfd::EfdFlags;
-use nix::unistd::close;
-use nix::unistd::read;
+use nix::sys::eventfd::{EfdFlags, EventFd};
+use nix::unistd::{close, read};
 use snafu::ResultExt;
 use std::fs::File;
-use std::os::unix::io::RawFd;
 use std::os::unix::prelude::*;
+use crate::sim_client::SimClient;
+use crate::protos::simcalls::{
+    InterruptStatusRequest,
+    RegisterInterrupt,
+    DeregisterInterrupt,
+};
+use crate::sim_client;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -39,18 +44,92 @@ pub enum Error {
 
     #[snafu(display("Could not register eventfd with driver: {}", source))]
     ErrorEventFDRegister { source: nix::Error },
+
+    #[snafu(display("{}", source))]
+    SimClientError { source: sim_client::Error },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Getters, Setters)]
+pub struct SimInterrupt {
+    interrupt: EventFd,
+    client: SimClient,
+}
+
+#[derive(Debug, Getters, Setters)]
 pub struct Interrupt {
-    interrupt: RawFd,
+    interrupt: EventFd,
+}
+
+impl Drop for SimInterrupt {
+    fn drop(&mut self) {
+        let _ = close(self.interrupt.as_raw_fd());
+        trace!("deregistering interrupt: {:?}", self.interrupt);
+        let _ = self.client.deregister_interrupt(DeregisterInterrupt { fd: self.interrupt.as_raw_fd() }).context(SimClientSnafu);
+    }
 }
 
 impl Drop for Interrupt {
     fn drop(&mut self) {
-        let _ = close(self.interrupt);
+        let _ = close(self.interrupt.as_raw_fd());
+        trace!("deregistering interrupt: {:?}", self.interrupt);
+    }
+}
+
+pub trait TapascoInterrupt: Debug {
+    fn wait_for_interrupt(&self) -> Result<u64>;
+    fn check_for_interrupt(&self) -> Result<u64>;
+}
+
+/// Handles interrupts using TLKM and Eventfd
+///
+/// Registers the eventfd with the driver and makes sure to release it after use.
+/// Supports blocking of the wait_for_interrupt method.
+impl SimInterrupt {
+    pub fn new(interrupt_id: usize, blocking: bool) -> Result<Box<dyn TapascoInterrupt + Sync + Send>> {
+        let fd = if blocking {
+            EventFd::from_value(0).context(ErrorEventFDSnafu)?
+        } else {
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).context(ErrorEventFDSnafu)?
+        };
+
+        let client = SimClient::new().context(SimClientSnafu)?;
+        client.register_interrupt(RegisterInterrupt {
+            fd: fd.as_raw_fd(),
+            interrupt_id: interrupt_id as i32,
+        }).context(SimClientSnafu)?;
+
+        Ok(Box::new(Self { interrupt: fd, client }))
+    }
+}
+
+impl TapascoInterrupt for SimInterrupt {
+
+    /// Wait for an interrupt as indicated by the eventfd
+    ///
+    /// Returns the number of interrupts that have occured since the last time
+    /// calling this function.
+    /// Returns at least 1
+    fn wait_for_interrupt(&self) -> Result<u64> {
+        loop {
+            let interrupts = self.client.get_interrupt_status(InterruptStatusRequest { fd: self.interrupt.as_raw_fd() }).context(SimClientSnafu)?;
+            if interrupts > 0 {
+                return Ok(interrupts);
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Check if any interrupts have occured
+    ///
+    /// Returns the number of interrupts that have occured since the last time
+    /// calling this function or 0 if none have occured.
+    /// This function behaves like wait_for_interrupt if blocking mode has been selected
+    /// as the `read` will block in this case until an interrupt occurs.
+    fn check_for_interrupt(&self) -> Result<u64> {
+        let interrupts = self.client.get_interrupt_status(InterruptStatusRequest { fd: self.interrupt.as_raw_fd() }).context(SimClientSnafu)?;
+        Ok(interrupts)
     }
 }
 
@@ -59,14 +138,14 @@ impl Drop for Interrupt {
 /// Registers the eventfd with the driver and makes sure to release it after use.
 /// Supports blocking of the wait_for_interrupt method.
 impl Interrupt {
-    pub fn new(tlkm_file: &File, interrupt_id: usize, blocking: bool) -> Result<Self> {
+    pub fn new(tlkm_file: &File, interrupt_id: usize, blocking: bool) -> Result<Box<dyn TapascoInterrupt + Sync + Send>> {
         let fd = if blocking {
-            eventfd(0, EfdFlags::empty()).context(ErrorEventFDSnafu)?
+            EventFd::from_value(0).context(ErrorEventFDSnafu)?
         } else {
-            eventfd(0, EfdFlags::EFD_NONBLOCK).context(ErrorEventFDSnafu)?
+            EventFd::from_value_and_flags(0, EfdFlags::EFD_NONBLOCK).context(ErrorEventFDSnafu)?
         };
         let mut ioctl_fd = tlkm_register_interrupt {
-            fd,
+            fd: fd.as_raw_fd(),
             pe_id: interrupt_id as i32,
         };
 
@@ -75,18 +154,21 @@ impl Interrupt {
                 .context(ErrorEventFDRegisterSnafu)?;
         };
 
-        Ok(Self { interrupt: fd })
+        Ok(Box::new(Self { interrupt: fd }))
     }
+}
+
+impl TapascoInterrupt for Interrupt {
 
     /// Wait for an interrupt as indicated by the eventfd
     ///
     /// Returns the number of interrupts that have occured since the last time
     /// calling this function.
     /// Returns at least 1
-    pub fn wait_for_interrupt(&self) -> Result<u64> {
+    fn wait_for_interrupt(&self) -> Result<u64> {
         let mut buf = [0u8; 8];
         loop {
-            let r = read(self.interrupt, &mut buf);
+            let r = read(self.interrupt.as_raw_fd(), &mut buf);
             match r {
                 Ok(_) => {
                     return Ok(u64::from_ne_bytes(buf));
@@ -108,10 +190,10 @@ impl Interrupt {
     /// calling this function or 0 if none have occured.
     /// This function behaves like wait_for_interrupt if blocking mode has been selected
     /// as the `read` will block in this case until an interrupt occurs.
-    pub fn check_for_interrupt(&self) -> Result<u64> {
+    fn check_for_interrupt(&self) -> Result<u64> {
         let mut buf = [0u8; 8];
         loop {
-            let r = read(self.interrupt, &mut buf);
+            let r = read(self.interrupt.as_raw_fd(), &mut buf);
             match r {
                 Ok(_) => {
                     return Ok(u64::from_ne_bytes(buf));

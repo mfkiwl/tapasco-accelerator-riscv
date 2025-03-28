@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020 Embedded Systems and Applications, TU Darmstadt.
+ * Copyright (c) 2014-2023 Embedded Systems and Applications, TU Darmstadt.
  *
  * This file is part of TaPaSCo
  * (see https://github.com/esa-tu-darmstadt/tapasco).
@@ -46,3 +46,6 @@ pub mod pe;
 pub mod scheduler;
 pub mod vfio;
 pub mod tlkm;
+pub mod sim_client;
+pub mod protos;
+pub mod mmap_mut;

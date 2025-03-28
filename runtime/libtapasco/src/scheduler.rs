@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020 Embedded Systems and Applications, TU Darmstadt.
+ * Copyright (c) 2014-2023 Embedded Systems and Applications, TU Darmstadt.
  *
  * This file is part of TaPaSCo
  * (see https://github.com/esa-tu-darmstadt/tapasco).
@@ -18,20 +18,22 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-use crate::debug::UnsupportedDebugGenerator;
-use crate::debug::{DebugGenerator, NonDebugGenerator};
 use crate::device::OffchipMemory;
 use crate::pe::PEId;
 use crate::pe::PE;
+use crate::job::Job;
 use crossbeam::deque::{Injector, Steal};
 use lockfree::map::Map;
-use memmap::MmapMut;
 use snafu::ResultExt;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::sync::Arc;
 use std::thread;
+use crate::debug::{DebugGenerator, NonDebugGenerator, UnsupportedDebugGenerator};
+use crate::mmap_mut::MemoryType;
+use crate::protos::status;
+use core::fmt::Debug;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -56,9 +58,16 @@ pub enum Error {
 
     #[snafu(display("Debug Error: {}", source))]
     DebugError { source: crate::debug::Error },
+
+    #[snafu(display("Local memory requested on PE without local memory"))]
+    NoLocalMemory {},
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub trait ReleasePE: Debug {
+    fn release_pe(&self, pe: PE) -> Result<()>;
+}
 
 /// Main method to retrieve a PE for execution
 ///
@@ -73,8 +82,8 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(
-        pes: &[crate::device::status::Pe],
-        mmap: &Arc<MmapMut>,
+        pes: &[status::Pe],
+        arch: &Arc<MemoryType>,
         mut local_memories: VecDeque<Arc<OffchipMemory>>,
         completion: &File,
         debug_impls: &HashMap<String, Box<dyn DebugGenerator + Sync + Send>>,
@@ -91,16 +100,16 @@ impl Scheduler {
             let debug = match &pe.debug {
                 Some(x) => match debug_impls.get(&x.name) {
                     Some(y) => y
-                        .new(mmap, x.name.clone(), x.offset, x.size)
+                        .new(&arch, x.name.clone(), x.offset, x.size)
                         .context(DebugSnafu)?,
                     None => {
                         let d = UnsupportedDebugGenerator {};
-                        d.new(mmap, x.name.clone(), 0, 0).context(DebugSnafu)?
+                        d.new(&arch, x.name.clone(), 0, 0).context(DebugSnafu)?
                     }
                 },
                 None => {
                     let d = NonDebugGenerator {};
-                    d.new(mmap, "Unused".to_string(), 0, 0)
+                    d.new(&arch, "Unused".to_string(), 0, 0)
                         .context(DebugSnafu)?
                 }
             };
@@ -124,7 +133,7 @@ impl Scheduler {
                 i,
                 pe.id as PEId,
                 pe.offset,
-                mmap.clone(),
+                arch.clone(),
                 completion,
                 interrupt_id,
                 debug,
@@ -166,18 +175,31 @@ impl Scheduler {
         })
     }
 
-    pub fn acquire_pe(&self, id: PEId) -> Result<PE> {
+    fn do_acquire_pe(&self, id: PEId, block: bool) -> Result<Option<PE>> {
         match self.pes.get(&id) {
             Some(l) => loop {
                 match l.val().steal() {
-                    Steal::Success(pe) => return Ok(pe),
+                    Steal::Success(pe) => return Ok(Some(pe)),
                     Steal::Empty => (),
                     Steal::Retry => (),
+                }
+                trace!("Failed to steal PE");
+                if !block {
+                    return Ok(None);
                 }
                 thread::yield_now();
             },
             None => Err(Error::NoSuchPE { id }),
         }
+    }
+
+    pub fn acquire_pe(&self, id: PEId) -> Result<PE> {
+        let pe = self.do_acquire_pe(id, true)?;
+        Ok(pe.unwrap())
+    }
+
+    pub fn try_acpuire_pe(&self, id: PEId) -> Result<Option<PE>> {
+        self.do_acquire_pe(id, false)
     }
 
     pub fn release_pe(&self, pe: PE) -> Result<()> {
@@ -230,4 +252,105 @@ impl Scheduler {
             possible: self.pes_name.values().cloned().collect(),
         })
     }
+}
+
+impl ReleasePE for Scheduler {
+    fn release_pe(&self, pe: PE) -> Result<()> {
+        ensure!(!pe.active(), PEStillActiveSnafu { pe });
+
+        match self.pes.get(pe.type_id()) {
+            Some(l) => l.val().push(pe),
+            None => return Err(Error::NoSuchPE { id: *pe.type_id() }),
+        }
+        Ok(())
+    }
+}
+
+
+#[derive(Debug)]
+pub struct SinglePEHandler {
+    scheduler: Arc<SinglePEScheduler>,
+    release: Arc<dyn ReleasePE>,
+    released: bool,
+}
+
+#[derive(Debug)]
+pub struct SinglePEScheduler {
+    pe: Injector<PE>,
+    local_memory: Option<Arc<OffchipMemory>>,
+}
+
+impl SinglePEHandler {
+    pub fn new(
+        pe: PE,
+        release: &Arc<impl ReleasePE + 'static>,
+    ) -> Self {
+        SinglePEHandler {
+            scheduler: Arc::new(SinglePEScheduler::new(pe)),
+            release: release.clone(),
+            released: false
+        }
+    }
+
+    pub fn acquire_pe(&self) -> Result<Job> {
+        if self.released {
+            Err(Error::PEUnavailable {id: 0 })
+        } else {
+            Ok(Job::new(self.scheduler.acquire_pe(), &self.scheduler))
+        }
+    }
+
+    pub fn get_local_memory(&self) -> Result<&Arc<OffchipMemory>, Error> {
+        self.scheduler.get_local_memory()
+    }
+
+    pub fn release_pe(&mut self) -> Result<()> {
+        if !self.released {
+            self.released = true;
+            self.release.release_pe(self.scheduler.acquire_pe())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl SinglePEScheduler {
+    pub fn new(
+        pe: PE,
+    ) -> Self {
+        let v = Injector::new();
+        let memory = pe.local_memory().clone();
+        v.push(pe);
+        SinglePEScheduler {
+            pe: v,
+            local_memory: memory,
+        }
+    }
+
+    pub fn acquire_pe(&self) -> PE {
+        loop {
+            match self.pe.steal() {
+                Steal::Success(pe) => return pe,
+                Steal::Empty => (),
+                Steal::Retry => (),
+            }
+            thread::yield_now();
+        }
+    }
+
+    pub fn get_local_memory(&self) -> Result<&Arc<OffchipMemory>, Error> {
+        match &self.local_memory {
+            Some(m) => Ok(m),
+            None => Err(Error::NoLocalMemory {}),
+        }
+    }
+}
+
+impl ReleasePE for SinglePEScheduler {
+
+    fn release_pe(&self, pe: PE) -> Result<()> {
+        self.pe.push(pe);
+        Ok(())
+    }
+
 }

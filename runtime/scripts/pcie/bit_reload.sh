@@ -34,12 +34,14 @@ LOG_ID=$DRIVER"|""pci"
 show_usage() {
 	cat << EOF
 Usage: ${0##*/} [-v|--verbose] [--d|--drv-reload] BITSTREAM
-Program first supported PCIe based FPGA found in JTAG chain with BITSTREAM.
+Program PCIe based FPGAs in JTAG chain with BITSTREAM.
 
 	-v	enable verbose output
 	-d	reload device driver
 	-n	do not load device driver
 	-p	program the device
+	-a <ADAPTER>	select programming adapter
+	-l	list available programming adapters
 	-h	hotplug the device
 EOF
 }
@@ -47,22 +49,26 @@ EOF
 hotplug() {
 	VENDOR=10EE
 	DEVICE=7038
-	PCIEDEVICE=`lspci -d $VENDOR:$DEVICE | sed -e "s/ .*//"`
-	echo "hotplugging device: $PCIEDEVICE"
+	VERSAL_DEVICE=B03F
+	PCIEDEVICES=`lspci -d $VENDOR:$DEVICE | cut -d " " -f1`
+	PCIEDEVICES+=" "
+	PCIEDEVICES+=`lspci -d $VENDOR:$VERSAL_DEVICE | cut -d " " -f1`
 	# remove device, if it exists
-	if [ -n "$PCIEDEVICE" ]; then
+	for PCIEDEVICE in $PCIEDEVICES; do
+		echo "hotplugging device: $PCIEDEVICE"
 		sudo sh -c "echo 1 >/sys/bus/pci/devices/0000:$PCIEDEVICE/remove"
-
-	fi
+	done
 
 	sleep 1
 
 	# Scan for new hotplugable device, like the one may deleted before
 	sudo sh -c "echo 1 > /sys/bus/pci/rescan"
 
-	PCIEDEVICE=`lspci -d $VENDOR:$DEVICE | sed -e "s/ .*//"`
+	PCIEDEVICES_AFTER=`lspci -d $VENDOR:$DEVICE | cut -d " " -f1`
+	PCIEDEVICES_AFTER+=" "
+	PCIEDEVICES_AFTER+=`lspci -d $VENDOR:$VERSAL_DEVICE | cut -d " " -f1`
 
-	if [ -n "$PCIEDEVICE" ]; then
+	if [ -n "$PCIEDEVICES_AFTER" ] && [ $(echo -n "$PCIEDEVICES_AFTER" | wc -l) -ge $(echo -n "$PCIEDEVICES" | wc -l) ]; then
 		echo "hotplugging finished"
 	else
 		echo "ERROR: Could not find the device after hotplugging."
@@ -78,9 +84,11 @@ RELOADD=0
 NOLOADD=0
 HOTPLUG=0
 PROGRAM=0
+ADAPTER="NOADAPTER"
+LISTADAPTER=0
 
 OPTIND=1
-while getopts vdnhp opt; do
+while getopts vdnhpa:l opt; do
 	case $opt in
 		v)
 			VERBOSE=1
@@ -97,6 +105,12 @@ while getopts vdnhp opt; do
 		p)
 			PROGRAM=1
 			;;
+		a)
+			ADAPTER="$OPTARG"
+			;;
+		l)
+			LISTADAPTER=1
+			;;
 		*)
 			echo "unknown option: $opt"
 			show_usage
@@ -112,7 +126,7 @@ then
 	echo "bitstream = $BITSTREAM"
 
 	# unload driver, if reload_driver was set
-	if [ $RELOADD -gt 0 ]; then
+	if [ $LISTADAPTER -eq 0 ] && [ $RELOADD -gt 0 ]; then
 		# don't try to unload a not loaded driver
 		if [ `lsmod | grep $DRIVER | wc -l` -gt 0 ]; then
 			echo "unloading tlkm"
@@ -121,20 +135,27 @@ then
 	fi
 
 	# program the device
-	if [ $PROGRAM -gt 0 ]; then
-
-		if [ $VERBOSE -gt 0 ]; then
-			vivado -nolog -nojournal -notrace -mode tcl -source $BITLOAD_SCRIPT -tclargs $BITSTREAM
+	if [ $LISTADAPTER -gt 0 ] || [ $PROGRAM -gt 0 ]; then
+		set +e
+		if [ $LISTADAPTER -gt 0 ] || [ $VERBOSE -gt 0 ]; then
+			vivado -nolog -nojournal -notrace -mode tcl -source $BITLOAD_SCRIPT -tclargs --bit $BITSTREAM --adapter $ADAPTER --list-adapter $LISTADAPTER
 			VIVADORET=$?
 		else
 			echo "programming bitstream silently, this could take a while ..."
-			vivado -nolog -nojournal -notrace -mode batch -source $BITLOAD_SCRIPT -tclargs $BITSTREAM > /dev/null
+			vivado -nolog -nojournal -notrace -mode batch -source $BITLOAD_SCRIPT -tclargs --bit $BITSTREAM --adapter $ADAPTER --list-adapter $LISTADAPTER > /dev/null
 			VIVADORET=$?
 		fi
+		if [ $LISTADAPTER -gt 0 ]; then
+			exit
+		fi
+		set -e
 
 		# check return code
 		if [ $VIVADORET -ne 0 ]; then
-			echo "programming failed, Vivado returned non-zero exit code $VIVADORET"
+			echo "programming failed, Vivado returned non-zero exit code $VIVADORET."
+			if [ $VERBOSE -eq 0 ]; then
+				echo "Use --verbose for more details."
+			fi
 			exit $VIVADORET
 		fi
 		echo "bitstream programmed successfully!"

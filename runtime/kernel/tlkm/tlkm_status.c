@@ -22,6 +22,9 @@
 #include "tlkm_device.h"
 #include <pb_decode.h>
 
+bool parse_string(pb_istream_t *stream, const pb_field_t *field, void **arg);
+bool add_component(pb_istream_t *stream, const pb_field_t *field, void **arg);
+
 bool parse_string(pb_istream_t *stream, const pb_field_t *field, void **arg)
 {
 	size_t bytes_to_read =
@@ -51,7 +54,7 @@ bool add_component(pb_istream_t *stream, const pb_field_t *field, void **arg)
 	ret = pb_decode(stream, tapasco_status_Platform_fields, &plat);
 	help->dev->components[help->cntr].offset = plat.offset;
 	help->dev->components[help->cntr].size = plat.size;
-	DEVLOG(0, TLKM_LF_STATUS, "Detected component %s @ %lx with size %llx",
+	DEVLOG(help->dev->dev_id, TLKM_LF_STATUS, "Detected component %s @ %lx with size %llx",
 	       help->dev->components[help->cntr].name,
 	       help->dev->components[help->cntr].offset,
 	       help->dev->components[help->cntr].size);
